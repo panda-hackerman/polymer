@@ -9,21 +9,30 @@ import eu.pb4.polymer.common.api.events.BooleanEvent;
 import eu.pb4.polymer.common.api.events.FunctionEvent;
 import eu.pb4.polymer.common.impl.CompatStatus;
 import eu.pb4.polymer.core.api.block.PolymerBlockUtils;
+import eu.pb4.polymer.core.api.entity.PolymerEntity;
 import eu.pb4.polymer.core.api.entity.PolymerEntityUtils;
 import eu.pb4.polymer.core.api.other.PolymerComponent;
+import eu.pb4.polymer.core.api.utils.PolymerSyncedObject;
 import eu.pb4.polymer.core.api.utils.PolymerUtils;
 import eu.pb4.polymer.core.impl.PolymerImpl;
 import eu.pb4.polymer.core.impl.TransformingComponent;
 import eu.pb4.polymer.core.impl.compat.polymc.PolyMcUtils;
+import eu.pb4.polymer.rsm.api.RegistrySyncUtils;
+import it.unimi.dsi.fastutil.Function;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
+import it.unimi.dsi.fastutil.objects.ReferenceSet;
+import it.unimi.dsi.fastutil.objects.ReferenceSortedSets;
+import net.minecraft.block.BlockState;
 import net.minecraft.component.ComponentType;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.EnchantmentEffectComponentTypes;
 import net.minecraft.component.type.*;
+import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.attribute.DefaultAttributeRegistry;
 import net.minecraft.item.*;
 import net.minecraft.item.equipment.trim.ArmorTrim;
+import net.minecraft.item.tooltip.TooltipAppender;
 import net.minecraft.item.tooltip.TooltipType;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
@@ -36,6 +45,7 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.util.*;
+import net.minecraft.util.hit.BlockHitResult;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.UnmodifiableView;
 import xyz.nucleoid.packettweaker.PacketContext;
@@ -78,6 +88,7 @@ public final class PolymerItemUtils {
     public static final FunctionEvent<ItemModificationEventHandler, ItemStack> ITEM_MODIFICATION_EVENT = new FunctionEvent<>();
 
     public static final BooleanEvent<PolymerItemInteractionListener> POLYMER_ITEM_INTERACTION_CHECK = new BooleanEvent<>();
+    public static final BooleanEvent<PolymerIgnoreSoundExceptionListener> POLYMER_IGNORE_SOUND_EXCEPTED_ENTITY = new BooleanEvent<>();
 
     private static final IdentityHashMap<Item, List<ComponentType<?>>> FORCE_SYNCED_COMPONENTS = new IdentityHashMap<>();
 
@@ -102,7 +113,6 @@ public final class PolymerItemUtils {
             DataComponentTypes.ATTRIBUTE_MODIFIERS,
             DataComponentTypes.BANNER_PATTERNS,
             DataComponentTypes.BASE_COLOR,
-            DataComponentTypes.HIDE_TOOLTIP,
             DataComponentTypes.CAN_BREAK,
             DataComponentTypes.CAN_PLACE_ON,
             DataComponentTypes.REPAIR_COST,
@@ -125,23 +135,28 @@ public final class PolymerItemUtils {
             DataComponentTypes.GLIDER,
             DataComponentTypes.CUSTOM_MODEL_DATA,
             DataComponentTypes.DYED_COLOR,
-            DataComponentTypes.REPAIRABLE
+            DataComponentTypes.REPAIRABLE,
+            DataComponentTypes.BLOCKS_ATTACKS,
+            DataComponentTypes.BREAK_SOUND,
+            DataComponentTypes.PROVIDES_BANNER_PATTERNS,
+            DataComponentTypes.PROVIDES_TRIM_MATERIAL,
+            DataComponentTypes.WEAPON,
+            DataComponentTypes.TOOLTIP_DISPLAY
     };
-    @SuppressWarnings("rawtypes")
-    private static final List<HideableTooltip> HIDEABLE_TOOLTIPS = List.of(
-            HideableTooltip.of(DataComponentTypes.ATTRIBUTE_MODIFIERS, AttributeModifiersComponent::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.TRIM, ArmorTrim::withShowInTooltip),
-            HideableTooltip.ofNeg(DataComponentTypes.ENCHANTMENTS, ItemEnchantmentsComponent::isEmpty, ItemEnchantmentsComponent::withShowInTooltip),
-            HideableTooltip.ofNeg(DataComponentTypes.STORED_ENCHANTMENTS, ItemEnchantmentsComponent::isEmpty, ItemEnchantmentsComponent::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.UNBREAKABLE, UnbreakableComponent::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.CAN_BREAK, BlockPredicatesChecker::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.CAN_PLACE_ON, BlockPredicatesChecker::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.JUKEBOX_PLAYABLE, JukeboxPlayableComponent::withShowInTooltip),
-            HideableTooltip.of(DataComponentTypes.DYED_COLOR, DyedColorComponent::withShowInTooltip)
-    );
 
     private static boolean stonecutterFix = PolymerImpl.FIX_STONECUTER;
+    private static final ReferenceSet<ComponentType<?>> FORCE_HIDE_TOOLTIP = ReferenceSet.of(
+            DataComponentTypes.UNBREAKABLE,
+            DataComponentTypes.ATTRIBUTE_MODIFIERS,
+            DataComponentTypes.BLOCK_ENTITY_DATA,
+            DataComponentTypes.CAN_BREAK,
+            DataComponentTypes.CAN_PLACE_ON,
+            DataComponentTypes.DAMAGE
+    );
 
+    private static final ReferenceSet<ComponentType<?>> IGNORE_TOOLTIP_HIDING = ReferenceSet.of(
+        DataComponentTypes.LORE
+    );
 
 
     private PolymerItemUtils() {
@@ -169,7 +184,7 @@ public final class PolymerItemUtils {
     public static ItemStack getPolymerItemStack(ItemStack itemStack, TooltipType tooltipContext, PacketContext context) {
         if (getPolymerIdentifier(itemStack) != null) {
             return itemStack;
-        } else if (itemStack.getItem() instanceof PolymerItem item) {
+        } else if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, itemStack.getItem()) instanceof PolymerItem item) {
             return item.getPolymerItemStack(itemStack, tooltipContext, context);
         } else if (isPolymerServerItem(itemStack, context)) {
             return createItemStack(itemStack, tooltipContext, context);
@@ -299,6 +314,10 @@ public final class PolymerItemUtils {
 
         return nbtData.get(POLYMER_STACK_COMPONENTS_CODEC).result().orElse(Map.of());
     }
+    public static void registerOverlay(Item item, PolymerItem polymerItem) {
+        PolymerSyncedObject.setSyncedObject(Registries.ITEM, item, polymerItem);
+        RegistrySyncUtils.setServerEntry(Registries.ITEM, item);
+    }
 
     public static boolean isPolymerServerItem(ItemStack itemStack) {
         return isPolymerServerItem(itemStack, PacketContext.get());
@@ -308,7 +327,7 @@ public final class PolymerItemUtils {
         if (getPolymerIdentifier(itemStack) != null) {
             return false;
         }
-        if (itemStack.getItem() instanceof PolymerItem) {
+        if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, itemStack.getItem()) instanceof PolymerItem) {
             return true;
         }
 
@@ -322,7 +341,7 @@ public final class PolymerItemUtils {
             }
         }
 
-        if (itemStack.contains(DataComponentTypes.ENCHANTMENTS) && itemStack.getOrDefault(DataComponentTypes.ATTRIBUTE_MODIFIERS, AttributeModifiersComponent.DEFAULT).showInTooltip()) {
+        if (itemStack.contains(DataComponentTypes.ENCHANTMENTS) && itemStack.getOrDefault(DataComponentTypes.TOOLTIP_DISPLAY, TooltipDisplayComponent.DEFAULT).shouldDisplay(DataComponentTypes.ATTRIBUTE_MODIFIERS)) {
             for (var ench : itemStack.getOrDefault(DataComponentTypes.ENCHANTMENTS, ItemEnchantmentsComponent.DEFAULT).getEnchantments()) {
                 var attributes = ench.value().getEffect(EnchantmentEffectComponentTypes.ATTRIBUTES);
                 if (attributes != null) {
@@ -363,7 +382,7 @@ public final class PolymerItemUtils {
         Item item = itemStack.getItem();
         Identifier model = null;
         boolean storeCount;
-        if (itemStack.getItem() instanceof PolymerItem virtualItem) {
+        if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, itemStack.getItem()) instanceof PolymerItem virtualItem) {
             var data = PolymerItemUtils.getItemSafely(virtualItem, itemStack, context);
             item = data.item();
             storeCount = virtualItem.shouldStorePolymerItemStackCount();
@@ -397,7 +416,7 @@ public final class PolymerItemUtils {
             }
         }
 
-        if (itemStack.getItem() instanceof PolymerItem polymerItem) {
+        if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, itemStack.getItem()) instanceof PolymerItem polymerItem) {
             polymerItem.modifyBasePolymerItemStack(out, itemStack, context);
         }
 
@@ -450,24 +469,22 @@ public final class PolymerItemUtils {
             out.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.DEFAULT.with(RegistryOps.of(NbtOps.INSTANCE, lookup), POLYMER_STACK_ID_CODEC, Registries.ITEM.getId(itemStack.getItem())).getOrThrow());
         }
 
-        out.set(DataComponentTypes.HIDE_ADDITIONAL_TOOLTIP, Unit.INSTANCE);
 
-        for (var x : HIDEABLE_TOOLTIPS) {
-            var a = out.get(x.type);
-            //noinspection unchecked
-            if (a != null && x.shouldSet.test(a)) {
-                //noinspection unchecked
-                out.set(x.type, x.setter.setTooltip(a, false));
+        var display = out.getOrDefault(DataComponentTypes.TOOLTIP_DISPLAY, TooltipDisplayComponent.DEFAULT);
+        for (var x : out.getComponents()) {
+            if (!IGNORE_TOOLTIP_HIDING.contains(x.type()) && (x.value() instanceof TooltipAppender || FORCE_HIDE_TOOLTIP.contains(x.type()))) {
+                display = display.with(x.type(), true);
             }
         }
+        out.set(DataComponentTypes.TOOLTIP_DISPLAY, display);
 
         try {
             var tooltip = itemStack.getTooltip(context.getPlayer() != null ? Item.TooltipContext.create(context.getPlayer().getRegistryManager()) : Item.TooltipContext.DEFAULT, context.getPlayer(), tooltipContext);
             if (!tooltip.isEmpty()) {
                 tooltip.removeFirst();
 
-                if (itemStack.getItem() instanceof PolymerItem) {
-                    ((PolymerItem) itemStack.getItem()).modifyClientTooltip(tooltip, itemStack, context);
+                if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, itemStack.getItem()) instanceof PolymerItem polymerItem) {
+                    polymerItem.modifyClientTooltip(tooltip, itemStack, context);
                 }
                 if (!tooltip.isEmpty()) {
                     var lore = new ArrayList<Text>();
@@ -477,7 +494,7 @@ public final class PolymerItemUtils {
                     out.set(DataComponentTypes.LORE, new LoreComponent(lore));
                 }
             } else {
-                out.set(DataComponentTypes.HIDE_ADDITIONAL_TOOLTIP, Unit.INSTANCE);
+                out.set(DataComponentTypes.TOOLTIP_DISPLAY, new TooltipDisplayComponent(true, ReferenceSortedSets.emptySet()));
             }
         } catch (Throwable e) {
             if (PolymerImpl.LOG_MORE_ERRORS) {
@@ -511,7 +528,7 @@ public final class PolymerItemUtils {
         PolymerItem lastVirtual = item;
 
         int req = 0;
-        while (out instanceof PolymerItem newItem && newItem != item && req < maxDistance) {
+        while (PolymerSyncedObject.getSyncedObject(Registries.ITEM, out) instanceof PolymerItem newItem && newItem != item && req < maxDistance) {
             out = newItem.getPolymerItem(stack, context);
             lastVirtual = newItem;
             req++;
@@ -540,10 +557,17 @@ public final class PolymerItemUtils {
     }
 
     public static boolean isPolymerItemInteraction(ServerPlayerEntity player, ItemStack stack, Hand hand, ServerWorld world, ActionResult actionResult) {
-        if (stack.getItem() instanceof PolymerItem polymerItem && polymerItem.isPolymerItemInteraction(player, hand, stack, world, actionResult)) {
+        if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, stack.getItem()) instanceof PolymerItem polymerItem && polymerItem.isPolymerItemInteraction(player, hand, stack, world, actionResult)) {
             return true;
         }
         return POLYMER_ITEM_INTERACTION_CHECK.invoke((x) -> x.isPolymerItemInteraction(player, hand, stack, world, actionResult));
+    }
+
+    public static boolean isIgnoringPlaySoundExceptedEntity(ServerPlayerEntity player, ItemStack stack, Hand hand, ServerWorld world) {
+        if (PolymerSyncedObject.getSyncedObject(Registries.ITEM, stack.getItem()) instanceof PolymerItem polymerItem && polymerItem.isIgnoringItemInteractionPlaySoundExceptedEntity(player, hand, stack, world)) {
+            return true;
+        }
+        return POLYMER_IGNORE_SOUND_EXCEPTED_ENTITY.invoke((x) -> x.isIgnoringItemInteractionPlaySoundExceptedEntity(player, hand, stack, world));
     }
 
     /**
@@ -577,6 +601,52 @@ public final class PolymerItemUtils {
         return FORCE_SYNCED_COMPONENTS.getOrDefault(item, List.of());
     }
 
+    public static boolean isServerItem(ItemStack stack, PacketContext context) {
+        if (isPolymerServerItem(stack, context)) {
+            return true;
+        }
+
+        if (CompatStatus.POLYMC && PolyMcUtils.isServerSide(Registries.ITEM, stack.getItem())) {
+            return true;
+        }
+
+        var container = stack.get(DataComponentTypes.CONTAINER);
+        if (container != null) {
+            for (var inner : container.iterateNonEmpty()) {
+                if (isServerItem(inner, context)) {
+                    return true;
+                }
+            }
+        }
+
+        var bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+        if (bundle != null) {
+            for (var inner : bundle.iterate()) {
+                if (isServerItem(inner, context)) {
+                    return true;
+                }
+            }
+        }
+
+        var remainder = stack.get(DataComponentTypes.USE_REMAINDER);
+        if (remainder != null) {
+            if (isServerItem(remainder.convertInto(), context)) {
+                return true;
+            }
+        }
+
+        var projectile = stack.get(DataComponentTypes.CHARGED_PROJECTILES);
+        if (projectile != null) {
+            for (var inner :projectile.getProjectiles()) {
+                if (isServerItem(inner, context)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     @FunctionalInterface
     public interface ItemModificationEventHandler {
         ItemStack modifyItem(ItemStack original, ItemStack client, PacketContext context);
@@ -587,25 +657,11 @@ public final class PolymerItemUtils {
         boolean isPolymerItemInteraction(ServerPlayerEntity player, Hand hand, ItemStack stack, ServerWorld world, ActionResult actionResult);
     }
 
-    public record ItemWithMetadata(Item item, @Nullable Identifier itemModel) {
+    @FunctionalInterface
+    public interface PolymerIgnoreSoundExceptionListener {
+        boolean isIgnoringItemInteractionPlaySoundExceptedEntity(ServerPlayerEntity player, Hand hand, ItemStack stack, ServerWorld world);
     }
 
-    private record HideableTooltip<T>(ComponentType<T> type, Predicate<T> shouldSet, TooltipSetter<T> setter) {
-
-        public static <T> HideableTooltip<T> of(ComponentType<T> type, TooltipSetter<T> setter) {
-            return new HideableTooltip<>(type, x -> true, setter);
-        }
-
-        public static <T> HideableTooltip<T> of(ComponentType<T> type, Predicate<T> shouldSet, TooltipSetter<T> setter) {
-            return new HideableTooltip<>(type, shouldSet, setter);
-        }
-
-        public static <T> HideableTooltip<T> ofNeg(ComponentType<T> type, Predicate<T> shouldntSet, TooltipSetter<T> setter) {
-            return new HideableTooltip<>(type, shouldntSet.negate(), setter);
-        }
-
-        interface TooltipSetter<T> {
-            T setTooltip(T val, boolean value);
-        }
+    public record ItemWithMetadata(Item item, @Nullable Identifier itemModel) {
     }
 }
